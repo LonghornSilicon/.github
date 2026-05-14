@@ -793,6 +793,17 @@ jobs:
           echo "dir=$CFG" >> "$GITHUB_OUTPUT"
           ls "$CFG/config.json"
 
+      - name: Dereference symlinks for Docker compatibility
+        working-directory: ${{ steps.cfg.outputs.dir }}
+        run: |
+          find . -type l | while read link; do
+            target=$(readlink -f "$link")
+            if [ -f "$target" ]; then
+              rm "$link"
+              cp "$target" "$link"
+            fi
+          done
+
       - name: Run LibreLane Sky130 flow
         working-directory: ${{ steps.cfg.outputs.dir }}
         run: |
