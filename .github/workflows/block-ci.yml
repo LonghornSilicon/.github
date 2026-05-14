@@ -141,6 +141,31 @@ jobs:
       name: rtl-functional-verification
       url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 1 — RTL Functional Verification
+
+            Purpose: Confirms the RTL behaves the way the spec says it should.
+                     This is the functional-correctness gate; if this fails,
+                     nothing else matters — the design is logically wrong.
+
+            Method:  Compiles and runs the block's testbenches via `make sim`
+                     and (optionally) `make sim_realdata` in the rtl/ directory.
+                     Both testbenches must print one of the canonical success
+                     strings: "ALL TESTS PASSED" or "Tests: N  Pass: N".
+
+            Catches: Logic bugs, off-by-one errors, missing reset paths,
+                     incorrect handshake sequences, anything where the design
+                     does the wrong thing on a known input.
+
+            Why it matters: Functional bugs caught here are cheap to fix;
+                     functional bugs caught at tape-out are catastrophic.
+                     This is the broadest, fastest gate, run first on every push.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -222,6 +247,33 @@ jobs:
     if: ${{ inputs.has-coverage-gate }}
     runs-on: ubuntu-latest
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 2 — Line Coverage Gate
+
+            Purpose: Confirms the testbench actually EXERCISES the design.
+                     A test suite that passes 100/100 cases but only touches
+                     30 % of the RTL is hiding bugs in the other 70 %.
+
+            Method:  Builds the block + testbench with Verilator's --binary
+                     mode and --coverage-line flag. Runs the sim, parses
+                     verilator_coverage output, asserts ≥ threshold % line
+                     coverage on the design (excluding the testbench itself).
+
+            Threshold: ${{ inputs.coverage-threshold }} %
+
+            Catches: "Tests pass but design is undertested" — the most common
+                     silent failure mode for a functional-verification gate.
+                     The 5–10 % uncovered lines usually contain the bugs.
+
+            Why it matters: Industry rule of thumb: 95 % line coverage for
+                     production silicon; 90 % is a reasonable lower bound
+                     for a CI gate.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -349,6 +401,35 @@ jobs:
       name: rtl-synthesis
       url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 3 — RTL Synthesis (Yosys)
+
+            Purpose: Confirms the RTL is synthesizable (can become real gates)
+                     and produces the EXPECTED amount of state.
+
+            Method:  Runs Yosys `synth -flatten` on the block's top SV file.
+                     Extracts total flip-flop count from the synthesized
+                     netlist using an awk pattern that handles Yosys 0.33's
+                     cell name format (\$_SDFFE_PN0P_ etc.). Asserts the
+                     FF count equals the expected-ff-count input — the
+                     closed-form prediction from the block's RTL spec.
+
+            Expected FFs: ${{ inputs.expected-ff-count }}
+
+            Catches: Inferred latches (when an `if` is missing an `else`),
+                     accidental state additions, missing-reset bugs, RTL
+                     that doesn't synthesize at all.
+
+            Why it matters: If a block's FF count doesn't match its
+                     closed-form prediction, someone added (or removed)
+                     state where they didn't mean to. The exact value is
+                     a deliberate spec contract.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - name: Install Yosys
@@ -434,6 +515,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 4 — Formal Equivalence (RTL ≡ post-synth netlist)
+
+            Purpose: Confirms the synthesized netlist is BIT-EXACTLY
+                     equivalent to the original RTL on ALL POSSIBLE INPUTS,
+                     not just on the testbench vectors.
+
+            Method:  Yosys equiv_make composes RTL ("gold") and the
+                     synthesized netlist ("gate") into one comparison design.
+                     equiv_induct -seq 5 then proves equivalence by
+                     sequential induction over input sequences up to length 5.
+                     equiv_status -assert exits non-zero if not proven.
+
+            Catches: Synthesis bugs --- cases where Yosys's optimizer made
+                     a logically-DIFFERENT transform during synthesis. Rare
+                     but devastating when missed; impossible to find with
+                     simulation alone.
+
+            Why it matters: This is the open-flow analogue of Cadence
+                     Conformal LEC. Functional sim runs the design on a
+                     finite set of input vectors; formal equivalence proves
+                     the synth output matches the RTL on every possible
+                     sequence of inputs the chip could ever see.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - name: Install Yosys
@@ -526,6 +636,35 @@ jobs:
     if: ${{ inputs.has-reference-model }}
     runs-on: ubuntu-latest
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 5 — Reference Model Tests (C++ + Python)
+
+            Purpose: Confirms the bit-accurate C++ and Python reference
+                     models — which the compiler team targets — agree with
+                     the RTL.
+
+            Method:  Runs `make test-all` under sw/reference_model/. That
+                     target builds the C++ test binaries, runs them against
+                     the RTL replay vectors, runs the Python test suite
+                     against the same vectors, and asserts identical decisions
+                     across both implementations and the RTL itself.
+
+            Catches: Model drift — when the C++ or Python reference quietly
+                     diverges from the RTL. The compiler team binds to the
+                     reference; if it disagrees with the RTL, their generated
+                     code will work in simulation against the model but fail
+                     on silicon. Worst kind of bug.
+
+            Why it matters: The reference is the spec, and silicon enforces
+                     the RTL. Keeping all three aligned is what lets us hand
+                     a backend to the compiler team and have it just work on
+                     the actual chip when silicon arrives.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -595,6 +734,42 @@ jobs:
       name: sky130-signoff
       url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 6 — OpenLane Sky130 Sign-Off
+
+            Purpose: Confirms the design is PHYSICALLY REALIZABLE on real
+                     silicon. The open-flow proxy for tape-out sign-off.
+                     If any check fails, the design cannot be manufactured.
+
+            Method:  Runs the LibreLane / OpenROAD flow against SkyWater
+                     Sky130A: synth → floorplan → place → CTS → route → STA
+                     → DRC → LVS → antenna → IR-drop → GDSII. Parses the
+                     final metrics.json and asserts six universal physical-
+                     verification checks are all zero:
+                       - timing__setup_vio__count
+                       - timing__hold_vio__count
+                       - magic__drc_error__count
+                       - design__lvs_error__count
+                       - route__antenna_violation__count
+                       - design__power_grid_violation__count
+
+            Catches: Timing failures, design-rule violations, layout-vs-
+                     schematic mismatches, plasma-process hazards, power
+                     grid integrity issues — every class of physical bug
+                     that can't be caught by simulation alone.
+
+            Why it matters: These are the same checks a real tape-out runs
+                     against the foundry's sign-off decks. Sky130 isn't our
+                     target node (16FFC is) but a clean Sky130 sign-off is
+                     the strongest open-flow proxy available.
+
+            Runtime: ~7-10 minutes per run, dominated by routing.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -709,6 +884,33 @@ jobs:
     if: ${{ inputs.has-paper }}
     runs-on: ubuntu-latest
     steps:
+      - name: About this gate (purpose and method)
+        run: |
+          cat <<'EOF'
+          ════════════════════════════════════════════════════════════════════
+            Gate 7 — Paper PDF Build
+
+            Purpose: Compiles the block's accompanying LaTeX paper. Catches
+                     LaTeX errors, missing citations, and undefined references
+                     early so the paper is always in a "press the button to
+                     get a PDF" state on master.
+
+            Method:  Standard 4-pass build:
+                     pdflatex → bibtex → pdflatex → pdflatex.
+                     Asserts no errors are emitted; warns on undefined refs.
+                     Uploads the resulting PDF as a workflow artifact.
+
+            Catches: Broken equations, missing bib entries, ref-name typos,
+                     overflowing tables, "I made a quick change and broke
+                     the build" regressions.
+
+            Why it matters: Papers are deliverables. Keeping them building
+                     on master means any teammate can produce the current
+                     PDF at any time without needing to debug LaTeX. Only
+                     blocks with a paper/ directory opt into this gate.
+          ════════════════════════════════════════════════════════════════════
+          EOF
+
       - uses: actions/checkout@v4
 
       - name: Install TeXLive
