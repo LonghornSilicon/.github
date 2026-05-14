@@ -1,0 +1,391 @@
+name: Block CI
+
+# Reusable CI workflow for LonghornSilicon block repos.
+#
+# Each block's repo has a thin .github/workflows/ci.yml that calls this
+# workflow with the block-specific parameters. One source of truth for
+# every block; bug fixes in here propagate to every repo on the next push.
+#
+# Usage in a calling repo:
+#
+#   name: CI
+#   on:
+#     push: { branches: [master] }
+#     pull_request: { branches: [master] }
+#     workflow_dispatch:
+#   jobs:
+#     ci:
+#       uses: LonghornSilicon/.github/.github/workflows/block-ci.yml@main
+#       with:
+#         block-name: kv_cache_engine
+#         expected-ff-count: 1248
+#         has-reference-model: true
+#         has-paper: false
+#
+# Today's CI gate is Sky130 OpenLane on GitHub-hosted Ubuntu (free,
+# unlimited, x86_64). A future cadence-16ffc-signoff job is structurally
+# present below but disabled (`if: false`) until a self-hosted runner
+# with the TSMC PDK + Genus/Innovus licenses is provisioned. Flip the
+# `if` to enable.
+
+on:
+  workflow_call:
+    inputs:
+      block-name:
+        description: "Block name — matches the SV top module and the LibreLane DESIGN_NAME. E.g. precision_controller, kv_cache_engine."
+        type: string
+        required: true
+      expected-ff-count:
+        description: "Number of flip-flops Yosys should infer for the default parameters. Closed-form prediction the synth job asserts against."
+        type: number
+        required: true
+      has-reference-model:
+        description: "Run the C++ and Python reference model tests under sw/reference_model/?"
+        type: boolean
+        default: true
+      has-paper:
+        description: "Build the paper under paper/<block>.tex?"
+        type: boolean
+        default: false
+      openlane-config-dir:
+        description: "Path to the LibreLane config dir (relative to repo root). Default: openlane/<block-name>/"
+        type: string
+        default: ""
+
+# Cancel older in-progress runs on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. Functional verification — iverilog testbenches.
+  # ------------------------------------------------------------------
+  rtl-functional-verification:
+    name: RTL functional verification
+    runs-on: ubuntu-latest
+    environment:
+      name: rtl-functional-verification
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install iverilog + numpy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iverilog
+          pip install --user numpy
+
+      - name: Generate replay test vectors (if Makefile target exists)
+        working-directory: rtl
+        run: |
+          if grep -qE '^testvectors:' Makefile 2>/dev/null; then
+            make testvectors
+          else
+            echo "(no testvectors target — skipping)"
+          fi
+
+      - name: Run testbenches
+        working-directory: rtl
+        run: |
+          set -e
+          PASS_REGEX="ALL TESTS PASSED|Tests: [0-9]+  Pass: [0-9]+"
+
+          if grep -qE '^sim:' Makefile 2>/dev/null; then
+            make sim 2>&1 | tee /tmp/sim.log
+            grep -qE "$PASS_REGEX" /tmp/sim.log || (echo "Directed TB failed"; exit 1)
+          fi
+
+          if grep -qE '^sim_realdata:' Makefile 2>/dev/null; then
+            make sim_realdata 2>&1 | tee /tmp/sim_realdata.log
+            grep -qE "$PASS_REGEX" /tmp/sim_realdata.log || (echo "Replay TB failed"; exit 1)
+          fi
+
+          {
+            echo "## RTL functional verification — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "Testbenches gated on \`ALL TESTS PASSED\` or \`Tests: N  Pass: N\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 2. Yosys synthesis with closed-form FF count assertion.
+  # ------------------------------------------------------------------
+  rtl-synthesis:
+    name: RTL synthesis (Yosys)
+    runs-on: ubuntu-latest
+    environment:
+      name: rtl-synthesis
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Yosys
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq yosys
+
+      - name: Synthesize ${{ inputs.block-name }}
+        working-directory: rtl
+        run: |
+          yosys -p "read_verilog -sv ${{ inputs.block-name }}.sv; \
+                    synth -flatten -top ${{ inputs.block-name }}" \
+                2>&1 | tee synth.log
+
+          # Yosys 0.33 emits cell names like $_SDFFE_PN0P_ with digits in the
+          # suffix; regex-on-DFF and sum the last column robustly handles both.
+          FF_COUNT=$(awk '/\$_S?DFF/ {sum+=$NF} END {print sum+0}' synth.log)
+          CELL_COUNT=$(awk '/Number of cells:/{print $NF; exit}' synth.log)
+          echo "FF count: $FF_COUNT (expected ${{ inputs.expected-ff-count }})"
+          echo "Total cells: $CELL_COUNT"
+
+          {
+            echo "## Yosys synthesis — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Flip-flops | $FF_COUNT (expected ${{ inputs.expected-ff-count }}) |"
+            echo "| Total cells | $CELL_COUNT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$FF_COUNT" = "${{ inputs.expected-ff-count }}" ] \
+            || { echo "FF count mismatch"; exit 1; }
+
+      - name: Upload synth log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yosys-synth-log-${{ inputs.block-name }}
+          path: rtl/synth.log
+          retention-days: 30
+
+  # ------------------------------------------------------------------
+  # 3. C++ + Python reference model tests (optional).
+  # ------------------------------------------------------------------
+  reference-model-tests:
+    name: Reference model tests (C++ + Python)
+    if: ${{ inputs.has-reference-model }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (numpy)
+        run: pip install --user numpy
+
+      - name: Build + test reference model
+        working-directory: sw/reference_model
+        run: |
+          if [ ! -f Makefile ]; then
+            echo "no Makefile under sw/reference_model — skipping"
+            exit 0
+          fi
+          make test-all
+
+  # ------------------------------------------------------------------
+  # 4. OpenLane Sky130 sign-off — the gate that verifies the design
+  # is physically realizable. Currently the canonical sign-off; will
+  # be supplemented (not replaced) by the 16FFC Cadence job below.
+  # ------------------------------------------------------------------
+  openlane-sky130:
+    name: OpenLane Sky130 sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: sky130-signoff
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install LibreLane
+        run: |
+          pip install --user librelane
+          export PATH="$HOME/.local/bin:$PATH"
+          which librelane
+          librelane --version
+
+      - name: Compute LibreLane config dir
+        id: cfg
+        run: |
+          CFG="${{ inputs.openlane-config-dir }}"
+          if [ -z "$CFG" ]; then
+            CFG="openlane/${{ inputs.block-name }}"
+          fi
+          echo "dir=$CFG" >> "$GITHUB_OUTPUT"
+          ls "$CFG/config.json"
+
+      - name: Run LibreLane Sky130 flow
+        working-directory: ${{ steps.cfg.outputs.dir }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          librelane --docker-no-tty --dockerized --condensed config.json
+
+      - name: Assert sign-off (zero violations across all corners)
+        working-directory: ${{ steps.cfg.outputs.dir }}
+        env:
+          BLOCK_NAME: ${{ inputs.block-name }}
+        run: |
+          LAST_RUN=$(ls -1 runs/ | tail -1)
+          echo "Validating $LAST_RUN"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          run = os.popen("ls -1 runs/ | tail -1").read().strip()
+          m = json.load(open(f"runs/{run}/final/metrics.json"))
+          checks = {
+              "setup_vio":     m["timing__setup_vio__count"],
+              "hold_vio":      m["timing__hold_vio__count"],
+              "drc_error":     m["magic__drc_error__count"],
+              "lvs_error":     m["design__lvs_error__count"],
+              "antenna_vio":   m["route__antenna_violation__count"],
+              "powergrid_vio": m["design__power_grid_violation__count"],
+          }
+          ok = all(v == 0 for v in checks.values())
+          ss = m["timing__setup__ws__corner:max_ss_100C_1v60"]
+          area = m["design__instance__area__stdcell"]
+          power = m["power__total"] * 1e6
+          ffs = m["design__instance__count__class:sequential_cell"]
+
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          out.write(f"## Sky130 sign-off — `{os.environ['BLOCK_NAME']}`\n\n")
+          out.write(f"**Status: {'PASS' if ok else 'FAIL'}**\n\n")
+          out.write("| Check | Count |\n|---|---:|\n")
+          for k, v in checks.items():
+              out.write(f"| {k} | {v} |\n")
+          out.write("\n| Metric | Value |\n|---|---:|\n")
+          out.write(f"| Setup WNS (SS) | {ss:+.3f} ns |\n")
+          out.write(f"| Stdcell area | {area:.0f} um² |\n")
+          out.write(f"| Power (TT) | {power:.1f} uW |\n")
+          out.write(f"| Flip-flops | {ffs} |\n")
+
+          if not ok:
+              print("SIGN-OFF FAILED:", {k: v for k, v in checks.items() if v != 0})
+              sys.exit(1)
+          print("SIGN-OFF PASSED — all corners clean")
+          PYEOF
+
+      - name: Upload GDS + metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sky130-signoff-${{ inputs.block-name }}
+          path: |
+            ${{ steps.cfg.outputs.dir }}/runs/*/final/gds/*.gds
+            ${{ steps.cfg.outputs.dir }}/runs/*/final/metrics.json
+            ${{ steps.cfg.outputs.dir }}/runs/*/final/render/*.png
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------
+  # 5. Paper build (optional, for blocks that have a paper/ dir).
+  # ------------------------------------------------------------------
+  paper-build:
+    name: Compile paper PDF
+    if: ${{ inputs.has-paper }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install TeXLive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended texlive-bibtex-extra texlive-publishers
+
+      - name: Build PDF
+        working-directory: paper
+        run: |
+          set -e
+          PAPER_FILE=$(ls *.tex | grep -v "_design\|_isa\|handout\|overview\|api" | head -1)
+          PAPER_NAME="${PAPER_FILE%.tex}"
+          pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
+          bibtex "$PAPER_NAME" 2>/dev/null || true
+          pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
+          pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
+          ls -lh "${PAPER_NAME}.pdf"
+
+      - name: Upload PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-pdf-${{ inputs.block-name }}
+          path: paper/*.pdf
+          retention-days: 30
+
+  # ====================================================================
+  # 6. Future: Cadence 16FFC sign-off on a self-hosted runner.
+  # ====================================================================
+  # Currently DISABLED. Enable when all three of the following are true:
+  #
+  #   (a) TSMC 16FFC PDK installed on a self-hosted runner
+  #       (Liberty .lib, technology .lef, std-cell .lef, QRC tech files,
+  #        sign-off decks).
+  #   (b) Genus / Innovus / Tempus licenses reachable from the runner.
+  #   (c) The runner is labeled exactly: self-hosted, linux, x64,
+  #       tsmc-16ffc. The `tsmc-16ffc` label gates which runner sees
+  #       the job (so general-purpose self-hosted runners don't pick
+  #       it up and immediately fail).
+  #
+  # Then flip `if: false` to `if: true` and push. The runner picks up
+  # the job on the next CI run; no other workflow changes needed.
+  #
+  # This job produces the canonical sign-off for tape-out (DRC/LVS/STA
+  # clean against the foundry's sign-off decks). The Sky130 OpenLane
+  # job above remains as the cross-check against the open flow.
+  # ====================================================================
+  cadence-16ffc-signoff:
+    name: Cadence 16FFC sign-off (RTL → GDSII)
+    if: false  # ← flip to `true` when PDK + licensed runner provisioned
+    runs-on: [self-hosted, linux, x64, tsmc-16ffc]
+    timeout-minutes: 240
+    environment:
+      name: cadence-16ffc-signoff
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Genus synthesis
+        working-directory: rtl
+        run: |
+          mkdir -p reports netlist
+          genus -files genus.tcl -log reports/genus.log
+
+      - name: Assert post-synth QoR
+        working-directory: rtl
+        run: |
+          # Setup WNS at SS sign-off corner must be >= 0.
+          WNS=$(awk '/Slack:/{print $NF; exit}' reports/timing_ss.rpt)
+          echo "Genus SS slack: $WNS"
+          # TODO: numeric comparison once the Genus log format is locked in.
+
+      - name: Innovus place + route
+        working-directory: rtl
+        run: |
+          innovus -files innovus.tcl -log reports/innovus.log
+
+      - name: Assert post-PnR sign-off
+        working-directory: rtl
+        run: |
+          # WNS at SS sign-off post-route must be >= 0.
+          # DRC + LVS must be clean against foundry decks.
+          echo "TODO: parse reports/pnr_summary.rpt + foundry-deck output"
+
+      - name: Upload GDS + reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cadence-16ffc-${{ inputs.block-name }}
+          path: |
+            rtl/results/*.gds
+            rtl/reports/*.rpt
+            rtl/netlist/*.v
+          retention-days: 30
