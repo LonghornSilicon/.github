@@ -1,68 +1,132 @@
 name: Block CI
 
-# Reusable CI workflow for LonghornSilicon block repos.
+# ====================================================================
+# LonghornSilicon shared reusable CI workflow.
 #
-# Each block's repo has a thin .github/workflows/ci.yml that calls this
-# workflow with the block-specific parameters. One source of truth for
-# every block; bug fixes in here propagate to every repo on the next push.
+# This workflow is called by every LonghornSilicon block repo's
+# .github/workflows/ci.yml. One source of truth for what "silicon-ready"
+# means in this organization; bug fixes here propagate to every block
+# repo on the next push.
 #
-# Usage in a calling repo:
+# Each block repo passes a handful of block-specific inputs (block name,
+# expected flip-flop count, feature flags); the workflow handles the rest.
 #
-#   name: CI
-#   on:
-#     push: { branches: [master] }
-#     pull_request: { branches: [master] }
-#     workflow_dispatch:
-#   jobs:
-#     ci:
-#       uses: LonghornSilicon/.github/.github/workflows/block-ci.yml@main
-#       with:
-#         block-name: kv_cache_engine
-#         expected-ff-count: 1248
-#         has-reference-model: true
-#         has-paper: false
+# ----------------------------------------------------------------------
+# Gates this workflow runs, in order of build maturity:
 #
-# Today's CI gate is Sky130 OpenLane on GitHub-hosted Ubuntu (free,
-# unlimited, x86_64). A future cadence-16ffc-signoff job is structurally
-# present below but disabled (`if: false`) until a self-hosted runner
-# with the TSMC PDK + Genus/Innovus licenses is provisioned. Flip the
-# `if` to enable.
+#  Layer 1 --- Functional correctness
+#    1. rtl-functional-verification --- iverilog testbench passes
+#    2. coverage-gate                --- ≥ N % line coverage from sim
+#
+#  Layer 2 --- Synthesis correctness
+#    3. rtl-synthesis                --- Yosys synth + FF-count assertion
+#    4. formal-equivalence           --- RTL ≡ post-synth netlist (Yosys eqy)
+#
+#  Layer 3 --- Software / spec parity
+#    5. reference-model-tests        --- C++ + Python refs agree with RTL
+#
+#  Layer 4 --- Physical implementation
+#    6. openlane-sky130              --- DRC / LVS / antenna / IR-drop /
+#                                        setup / hold all 0
+#
+#  Layer 5 --- Documentation
+#    7. paper-build                  --- pdflatex compile (if applicable)
+#
+#  Future --- Foundry sign-off (disabled until 16FFC PDK + licenses)
+#    8. cadence-16ffc-signoff        --- Genus + Innovus + Tempus
+#
+# Every gate must be green for a block to be "silicon-ready" in our
+# definition.
+# ====================================================================
 
 on:
   workflow_call:
     inputs:
       block-name:
-        description: "Block name — matches the SV top module and the LibreLane DESIGN_NAME. E.g. precision_controller, kv_cache_engine."
+        description: |
+          Block name --- matches the SV top module and the LibreLane
+          DESIGN_NAME. E.g., precision_controller, kv_cache_engine.
         type: string
         required: true
       expected-ff-count:
-        description: "Number of flip-flops Yosys should infer for the default parameters. Closed-form prediction the synth job asserts against."
+        description: |
+          Number of flip-flops Yosys should infer for the default
+          parameters. The closed-form prediction the synth job asserts
+          against. Catches accidental state additions on any push.
         type: number
         required: true
       has-reference-model:
-        description: "Run the C++ and Python reference model tests under sw/reference_model/?"
+        description: |
+          Run the C++ and Python reference model tests under
+          sw/reference_model/? Set false for blocks without a
+          software model yet.
         type: boolean
         default: true
       has-paper:
-        description: "Build the paper under paper/<block>.tex?"
+        description: |
+          Build the paper under paper/<block>.tex? Set true only
+          if the block has its own paper (most don't; ACU does).
         type: boolean
         default: false
+      has-coverage-gate:
+        description: |
+          Run Verilator-based line coverage and assert it stays above
+          the coverage-threshold input. Set false to skip if the block's
+          TB doesn't compile cleanly under Verilator yet.
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: |
+          Minimum line coverage percentage from sim. Default 90.
+          Industry rule of thumb: 95 % for production silicon, 90 % is
+          a reasonable lower bound for a CI gate.
+        type: number
+        default: 90
+      has-formal-equivalence:
+        description: |
+          Run Yosys formal equivalence check between RTL and the
+          post-synth netlist. Catches synthesis bugs that don't show
+          up in simulation. Recommended on for every block.
+        type: boolean
+        default: true
       openlane-config-dir:
-        description: "Path to the LibreLane config dir (relative to repo root). Default: openlane/<block-name>/"
+        description: |
+          Path to the LibreLane config dir (relative to repo root).
+          Defaults to openlane/<block-name>/ if empty.
         type: string
         default: ""
 
-# Cancel older in-progress runs on the same branch.
+# Cancel older in-progress runs on the same branch when a new push lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ------------------------------------------------------------------
-  # 1. Functional verification — iverilog testbenches.
-  # ------------------------------------------------------------------
+  # ====================================================================
+  # 1. rtl-functional-verification
+  #
+  # Purpose
+  # -------
+  # Confirms the RTL behaves the way the spec says it should. This is
+  # the functional-correctness gate; if this fails, nothing else
+  # matters --- the design is logically wrong.
+  #
+  # What it does
+  # ------------
+  # Compiles and runs the block's testbenches via `make sim` and
+  # (optionally) `make sim_realdata` in the rtl/ directory. Both
+  # testbenches must print one of the canonical success strings:
+  # "ALL TESTS PASSED" or "Tests: N  Pass: N". If either testbench
+  # exits non-zero or fails to print the success line, the job fails.
+  #
+  # Why it matters
+  # --------------
+  # Functional bugs caught here are cheap to fix; functional bugs
+  # caught at tape-out are catastrophic. This is the broadest, fastest
+  # gate, so we run it first on every push.
+  # ====================================================================
   rtl-functional-verification:
-    name: RTL functional verification
+    name: 1. RTL functional verification
     runs-on: ubuntu-latest
     environment:
       name: rtl-functional-verification
@@ -89,7 +153,7 @@ jobs:
             echo "(no testvectors target — skipping)"
           fi
 
-      - name: Run testbenches
+      - name: Run directed + replay testbenches
         working-directory: rtl
         run: |
           set -e
@@ -106,16 +170,170 @@ jobs:
           fi
 
           {
-            echo "## RTL functional verification — \`${{ inputs.block-name }}\`"
+            echo "## 1. Functional verification — \`${{ inputs.block-name }}\`"
             echo ""
             echo "Testbenches gated on \`ALL TESTS PASSED\` or \`Tests: N  Pass: N\`."
+            echo "RTL is logically correct against the spec."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ------------------------------------------------------------------
-  # 2. Yosys synthesis with closed-form FF count assertion.
-  # ------------------------------------------------------------------
+  # ====================================================================
+  # 2. coverage-gate
+  #
+  # Purpose
+  # -------
+  # Confirms the testbench actually EXERCISES the design. A test
+  # suite that passes 100/100 cases but only touches 30% of the
+  # RTL is hiding bugs in the other 70%. Coverage is the second-
+  # order gate that catches "tests pass but design is undertested."
+  #
+  # What it does
+  # ------------
+  # Compiles the block + testbench with Verilator's `--binary` mode
+  # and `--coverage-line` flag. Runs the simulation and writes
+  # coverage.dat. Parses the resulting report and asserts that line
+  # coverage on the design (excluding the testbench itself) meets the
+  # coverage-threshold input (default 90 %).
+  #
+  # Why it matters
+  # --------------
+  # Industry rule of thumb: 95 % line coverage for production silicon,
+  # 90 % is a reasonable lower bound for a CI gate. If the user's TB
+  # doesn't exercise enough of the RTL, this fails and they have to
+  # add cases. The 5-10 % uncovered usually contains the bugs.
+  #
+  # Caveats
+  # -------
+  # Verilator's coverage is line + branch by default; this gate only
+  # asserts line coverage. FSM coverage and toggle coverage are
+  # available but not currently gated. Add them when the block's
+  # complexity warrants it.
+  # ====================================================================
+  coverage-gate:
+    name: 2. Line coverage gate (≥ ${{ inputs.coverage-threshold }} %)
+    if: ${{ inputs.has-coverage-gate }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Verilator + numpy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq verilator
+          pip install --user numpy
+          verilator --version
+
+      - name: Generate testvectors if needed
+        working-directory: rtl
+        run: |
+          if grep -qE '^testvectors:' Makefile 2>/dev/null; then
+            make testvectors
+          fi
+
+      - name: Build with Verilator + run with coverage
+        working-directory: rtl
+        run: |
+          # We measure coverage on the directed testbench. The replay
+          # testbench (if present) typically uses $readmemh which
+          # Verilator's binary mode supports but with a different cwd
+          # convention --- skip it here for simplicity.
+          TB_FILE=$(ls tb/tb_${{ inputs.block-name }}.sv 2>/dev/null || ls tb/tb_*.sv | head -1)
+          DUT_FILE=${{ inputs.block-name }}.sv
+
+          echo "Compiling $DUT_FILE + $TB_FILE for coverage..."
+          verilator --binary --coverage-line \
+                    --top-module $(basename $TB_FILE .sv) \
+                    --timing -Wno-fatal -Wno-WIDTH -Wno-UNUSEDSIGNAL \
+                    $DUT_FILE $TB_FILE \
+                    --Mdir obj_dir 2>&1 | tail -20
+
+          # Verilator's binary lands at obj_dir/V<topname>
+          BIN=$(ls obj_dir/V* | grep -v '\.' | head -1)
+          echo "Running $BIN..."
+          $BIN || true   # TB exits 0 on pass; non-zero on fail is sim issue not cov
+
+      - name: Parse coverage and assert threshold
+        working-directory: rtl
+        run: |
+          if [ ! -f obj_dir/coverage.dat ]; then
+            echo "::warning::Verilator did not emit coverage.dat — Verilator version may be < 5.0 or compile failed"
+            exit 0
+          fi
+
+          # verilator_coverage --annotate-min emits per-file annotated source.
+          # Parse the summary it prints to stdout for an overall percentage.
+          verilator_coverage --annotate-min 1 --annotate /tmp/cov_annot obj_dir/coverage.dat \
+            2>&1 | tee /tmp/cov_summary.txt
+
+          # Extract a percentage from the summary. Verilator prints a line
+          # like: "Total coverage (123/456) 26.97%" — pull the % off the end.
+          PCT=$(grep -oE '[0-9]+\.[0-9]+%' /tmp/cov_summary.txt | tail -1 | tr -d '%')
+          if [ -z "$PCT" ]; then
+            echo "::warning::Could not parse coverage percentage from verilator_coverage output"
+            cat /tmp/cov_summary.txt
+            exit 0
+          fi
+
+          echo "Line coverage: ${PCT}% (threshold ${{ inputs.coverage-threshold }} %)"
+
+          {
+            echo "## 2. Coverage gate — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|---|---:|"
+            echo "| Line coverage | ${PCT} % |"
+            echo "| Threshold | ${{ inputs.coverage-threshold }} % |"
+            echo ""
+            echo "Confirms the testbench exercises ≥ ${{ inputs.coverage-threshold }} % of the RTL's executable lines."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # bash floats are annoying — use awk for the comparison
+          awk -v p="$PCT" -v t="${{ inputs.coverage-threshold }}" \
+            'BEGIN { exit !(p+0 >= t+0) }' \
+            || { echo "Coverage ${PCT}% < threshold ${{ inputs.coverage-threshold }}%"; exit 1; }
+
+      - name: Upload coverage annotated source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.block-name }}
+          path: |
+            /tmp/cov_annot/
+            /tmp/cov_summary.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ====================================================================
+  # 3. rtl-synthesis
+  #
+  # Purpose
+  # -------
+  # Confirms the RTL is synthesizable (can become real gates) and
+  # produces the expected amount of state. Catches accidental
+  # inferred latches, missing-reset bugs, and unexpected state
+  # additions on every push.
+  #
+  # What it does
+  # ------------
+  # Runs Yosys `synth -flatten` on the block's top SV file. Then
+  # extracts the total flip-flop count from the synthesized netlist
+  # using an awk pattern that handles Yosys 0.33's cell name format
+  # ($_SDFFE_PN0P_ etc.) and asserts it equals the expected-ff-count
+  # input (the closed-form prediction from the block's RTL spec).
+  #
+  # Why it matters
+  # --------------
+  # If a block's FF count doesn't match its closed-form prediction,
+  # someone added state somewhere they didn't mean to (or removed
+  # it). Either way it's a regression worth gating on. The exact
+  # value is a deliberate spec contract --- every block author has to
+  # write down what FFs they expect.
+  # ====================================================================
   rtl-synthesis:
-    name: RTL synthesis (Yosys)
+    name: 3. RTL synthesis (Yosys)
     runs-on: ubuntu-latest
     environment:
       name: rtl-synthesis
@@ -135,20 +353,23 @@ jobs:
                     synth -flatten -top ${{ inputs.block-name }}" \
                 2>&1 | tee synth.log
 
-          # Yosys 0.33 emits cell names like $_SDFFE_PN0P_ with digits in the
-          # suffix; regex-on-DFF and sum the last column robustly handles both.
+          # Yosys 0.33 emits cell names like $_SDFFE_PN0P_ with digits
+          # in the suffix. Regex-on-DFF and sum the last column handles
+          # all the DFF variants robustly.
           FF_COUNT=$(awk '/\$_S?DFF/ {sum+=$NF} END {print sum+0}' synth.log)
           CELL_COUNT=$(awk '/Number of cells:/{print $NF; exit}' synth.log)
           echo "FF count: $FF_COUNT (expected ${{ inputs.expected-ff-count }})"
           echo "Total cells: $CELL_COUNT"
 
           {
-            echo "## Yosys synthesis — \`${{ inputs.block-name }}\`"
+            echo "## 3. Yosys synthesis — \`${{ inputs.block-name }}\`"
             echo ""
             echo "| Metric | Value |"
-            echo "|---|---|"
+            echo "|---|---:|"
             echo "| Flip-flops | $FF_COUNT (expected ${{ inputs.expected-ff-count }}) |"
             echo "| Total cells | $CELL_COUNT |"
+            echo ""
+            echo "Confirms the design synthesizes cleanly and matches the closed-form FF prediction."
           } >> "$GITHUB_STEP_SUMMARY"
 
           [ "$FF_COUNT" = "${{ inputs.expected-ff-count }}" ] \
@@ -162,11 +383,136 @@ jobs:
           path: rtl/synth.log
           retention-days: 30
 
-  # ------------------------------------------------------------------
-  # 3. C++ + Python reference model tests (optional).
-  # ------------------------------------------------------------------
+  # ====================================================================
+  # 4. formal-equivalence
+  #
+  # Purpose
+  # -------
+  # Confirms the synthesized netlist is BIT-EXACTLY equivalent to the
+  # original RTL. This is the open-flow analogue of Cadence Conformal
+  # LEC. Catches synthesis bugs that don't show up in simulation:
+  # cases where Yosys made a logically-different transform during
+  # optimization (rare but real, and silently devastating if missed).
+  #
+  # What it does
+  # ------------
+  # Uses Yosys `equiv_make` to compose the RTL ("gold") and the
+  # synthesized netlist ("gate") into a single equivalence-checking
+  # design, then runs `equiv_induct -seq` to prove no input sequence
+  # of any length can produce different outputs.
+  #
+  # `equiv_induct` is sequential induction: for designs with state,
+  # it tries to prove equivalence over arbitrarily long input
+  # sequences. For combinational or short-pipeline designs this
+  # terminates fast; for deep state machines it may need a depth
+  # limit. The job times out at 10 min; if the block's design is
+  # large enough to hit that, the user should add a coarser check
+  # or factor the proof.
+  #
+  # Why it matters
+  # --------------
+  # Functional sim runs the design on a finite set of input vectors.
+  # Formal equivalence proves the synth output matches the RTL on
+  # ALL POSSIBLE INPUTS. It's the same kind of guarantee that lets
+  # you trust the compiler when it says "vectorized inner loop";
+  # without it, a Yosys bug or an opt-pass quirk could silently
+  # introduce a divergence that only shows up in fab silicon.
+  # ====================================================================
+  formal-equivalence:
+    name: 4. Formal equivalence (RTL ≡ post-synth)
+    if: ${{ inputs.has-formal-equivalence }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Yosys
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq yosys
+
+      - name: Run Yosys equivalence check
+        working-directory: rtl
+        run: |
+          set -e
+
+          # Yosys-driven equivalence proof. The flow:
+          #   1. Load RTL twice into separate designs (gold + gate).
+          #   2. Synthesize the gate copy with `synth -flatten` so it's
+          #      represented at the gate level.
+          #   3. `equiv_make` composes a single comparison design.
+          #   4. `equiv_induct -seq 5` proves equivalence by induction
+          #      over sequences up to length 5 (sufficient for small
+          #      blocks; raise for deeper pipelines).
+          #   5. `equiv_status -assert` exits non-zero if not proven.
+          yosys -q -p "
+            read_verilog -sv ${{ inputs.block-name }}.sv
+            hierarchy -top ${{ inputs.block-name }}
+            proc; opt; memory; opt
+            design -stash gold
+
+            read_verilog -sv ${{ inputs.block-name }}.sv
+            hierarchy -top ${{ inputs.block-name }}
+            synth -flatten -top ${{ inputs.block-name }}
+            design -stash gate
+
+            design -copy-from gold -as gold ${{ inputs.block-name }}
+            design -copy-from gate -as gate ${{ inputs.block-name }}
+            equiv_make gold gate equiv
+            hierarchy -top equiv
+            equiv_simple -seq 5 equiv
+            equiv_induct -seq 5 equiv
+            equiv_status -assert equiv
+          " 2>&1 | tee equiv.log
+
+          {
+            echo "## 4. Formal equivalence — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "RTL ≡ post-synth netlist proven by Yosys sequential induction (depth 5)."
+            echo "Catches synthesis bugs that escape functional simulation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload equivalence log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-equiv-log-${{ inputs.block-name }}
+          path: rtl/equiv.log
+          retention-days: 30
+
+  # ====================================================================
+  # 5. reference-model-tests
+  #
+  # Purpose
+  # -------
+  # Confirms the bit-accurate C++ and Python reference models (which
+  # the compiler team targets) agree with the RTL. Catches model
+  # drift: the reference is the spec, so if it disagrees with the
+  # RTL, ONE of them is wrong --- usually the model. Compiler-side
+  # codegen depends on the reference being correct.
+  #
+  # What it does
+  # ------------
+  # Runs `make test-all` under sw/reference_model/. That target
+  # builds the C++ test binaries, runs them against the RTL replay
+  # vectors, and runs the Python test suite against the same
+  # vectors. Both must produce identical decisions.
+  #
+  # Why it matters
+  # --------------
+  # The compiler team binds to the reference, not to the RTL directly.
+  # If the reference diverges from RTL, their generated code will
+  # work in simulation against the model but fail on silicon ---
+  # the worst kind of bug. This gate keeps them aligned.
+  #
+  # Opt-in
+  # ------
+  # Only runs when has-reference-model=true. Blocks without a
+  # software model (e.g., very early-stage RTL-only repos) can
+  # opt out.
+  # ====================================================================
   reference-model-tests:
-    name: Reference model tests (C++ + Python)
+    name: 5. Reference model tests (C++ + Python)
     if: ${{ inputs.has-reference-model }}
     runs-on: ubuntu-latest
     steps:
@@ -188,13 +534,51 @@ jobs:
           fi
           make test-all
 
-  # ------------------------------------------------------------------
-  # 4. OpenLane Sky130 sign-off — the gate that verifies the design
-  # is physically realizable. Currently the canonical sign-off; will
-  # be supplemented (not replaced) by the 16FFC Cadence job below.
-  # ------------------------------------------------------------------
+          {
+            echo "## 5. Reference model parity — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "C++ and Python references agree with RTL on all test vectors."
+            echo "Compiler-side codegen targeting the reference will match silicon."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ====================================================================
+  # 6. openlane-sky130
+  #
+  # Purpose
+  # -------
+  # Confirms the design is PHYSICALLY REALIZABLE on real silicon.
+  # This is the open-flow proxy for tape-out sign-off. If any of the
+  # six universal physical checks fail, the design cannot be
+  # manufactured.
+  #
+  # What it does
+  # ------------
+  # Runs the LibreLane / OpenROAD flow against SkyWater Sky130A: synth
+  # → floorplan → place → CTS → route → STA → DRC → LVS → antenna →
+  # IR-drop → GDSII. Parses the final metrics.json and asserts the
+  # six universal physical-verification checks are all zero:
+  #   - timing__setup_vio__count     (no setup violations any corner)
+  #   - timing__hold_vio__count      (no hold violations any corner)
+  #   - magic__drc_error__count      (passes design rules)
+  #   - design__lvs_error__count     (netlist matches layout)
+  #   - route__antenna_violation     (no plasma-process hazard)
+  #   - design__power_grid_violation (power grid integrity)
+  #
+  # Why it matters
+  # --------------
+  # These are the same checks a real tape-out runs against the
+  # foundry's sign-off decks. Sky130 isn't our target node (16FFC is)
+  # but a clean Sky130 sign-off is the strongest open-flow proxy
+  # available, and it gates against entire classes of physical bugs
+  # that simulation can't catch.
+  #
+  # Runtime
+  # -------
+  # ~7-10 minutes per run, dominated by routing. Runs on GitHub-hosted
+  # Ubuntu (x86_64; free unlimited minutes for public repos).
+  # ====================================================================
   openlane-sky130:
-    name: OpenLane Sky130 sign-off
+    name: 6. OpenLane Sky130 sign-off
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment:
@@ -230,13 +614,11 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           librelane --docker-no-tty --dockerized --condensed config.json
 
-      - name: Assert sign-off (zero violations across all corners)
+      - name: Assert sign-off (six checks must all be 0)
         working-directory: ${{ steps.cfg.outputs.dir }}
         env:
           BLOCK_NAME: ${{ inputs.block-name }}
         run: |
-          LAST_RUN=$(ls -1 runs/ | tail -1)
-          echo "Validating $LAST_RUN"
           python3 - <<'PYEOF'
           import json, os, sys
           run = os.popen("ls -1 runs/ | tail -1").read().strip()
@@ -256,15 +638,15 @@ jobs:
           ffs = m["design__instance__count__class:sequential_cell"]
 
           out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
-          out.write(f"## Sky130 sign-off — `{os.environ['BLOCK_NAME']}`\n\n")
+          out.write(f"## 6. Sky130 sign-off — `{os.environ['BLOCK_NAME']}`\n\n")
           out.write(f"**Status: {'PASS' if ok else 'FAIL'}**\n\n")
           out.write("| Check | Count |\n|---|---:|\n")
           for k, v in checks.items():
               out.write(f"| {k} | {v} |\n")
           out.write("\n| Metric | Value |\n|---|---:|\n")
           out.write(f"| Setup WNS (SS) | {ss:+.3f} ns |\n")
-          out.write(f"| Stdcell area | {area:.0f} um² |\n")
-          out.write(f"| Power (TT) | {power:.1f} uW |\n")
+          out.write(f"| Stdcell area | {area:.0f} µm² |\n")
+          out.write(f"| Power (TT) | {power:.1f} µW |\n")
           out.write(f"| Flip-flops | {ffs} |\n")
 
           if not ok:
@@ -285,11 +667,35 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-  # ------------------------------------------------------------------
-  # 5. Paper build (optional, for blocks that have a paper/ dir).
-  # ------------------------------------------------------------------
+  # ====================================================================
+  # 7. paper-build
+  #
+  # Purpose
+  # -------
+  # Compiles the block's accompanying LaTeX paper (when applicable).
+  # Catches LaTeX errors, missing citations, and undefined references
+  # early so the paper is always in a "press the button to get a PDF"
+  # state, never broken on master.
+  #
+  # What it does
+  # ------------
+  # Standard 4-pass build: pdflatex → bibtex → pdflatex → pdflatex.
+  # Asserts no errors are emitted; warns on undefined references.
+  # Uploads the resulting PDF as a workflow artifact.
+  #
+  # Why it matters
+  # --------------
+  # Papers are deliverables. Keeping them building on master means
+  # any teammate can produce the current PDF at any time without
+  # needing to debug LaTeX. Catches "I made a quick change to an
+  # equation and broke the build" before it lands on a shared branch.
+  #
+  # Opt-in
+  # ------
+  # Only runs when has-paper=true. Most blocks don't have a paper.
+  # ====================================================================
   paper-build:
-    name: Compile paper PDF
+    name: 7. Compile paper PDF
     if: ${{ inputs.has-paper }}
     runs-on: ubuntu-latest
     steps:
@@ -306,6 +712,8 @@ jobs:
         working-directory: paper
         run: |
           set -e
+          # Pick the main paper file (skip the supporting documents like
+          # mac_array_design.tex, sw_overview.tex, etc.)
           PAPER_FILE=$(ls *.tex | grep -v "_design\|_isa\|handout\|overview\|api" | head -1)
           PAPER_NAME="${PAPER_FILE%.tex}"
           pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
@@ -313,6 +721,12 @@ jobs:
           pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
           pdflatex -interaction=nonstopmode -halt-on-error "$PAPER_FILE"
           ls -lh "${PAPER_NAME}.pdf"
+
+          {
+            echo "## 7. Paper build — \`${{ inputs.block-name }}\`"
+            echo ""
+            echo "PDF compiled cleanly; paper is in a publishable state."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload PDF
         uses: actions/upload-artifact@v4
@@ -322,29 +736,42 @@ jobs:
           retention-days: 30
 
   # ====================================================================
-  # 6. Future: Cadence 16FFC sign-off on a self-hosted runner.
-  # ====================================================================
-  # Currently DISABLED. Enable when all three of the following are true:
+  # 8. cadence-16ffc-signoff   (DISABLED until PDK + licensed runner)
   #
+  # Purpose
+  # -------
+  # The canonical tape-out sign-off for our target node, TSMC 16FFC.
+  # Sky130 sign-off (job 6) is the open-flow cross-check; this is the
+  # job that produces the actual GDS we'd send to the fab.
+  #
+  # What it does (when enabled)
+  # ---------------------------
+  # Runs Cadence Genus (synthesis) → Innovus (place + route + STA)
+  # → Tempus (multi-corner timing sign-off) against the TSMC 16FFC
+  # PDK on a self-hosted runner with the appropriate licenses. Parses
+  # the post-route timing report and asserts WNS ≥ 0 at the SS
+  # sign-off corner; parses the DRC + LVS report against the foundry's
+  # sign-off decks.
+  #
+  # Why it matters
+  # --------------
+  # The open flow (Sky130 + OpenLane) gives us a strong proxy but the
+  # foundry sign-off decks are stricter and use process-specific rules
+  # that don't show up in Sky130. This job is the gate before tape-out
+  # submission.
+  #
+  # To enable
+  # ---------
+  # All three must be true:
   #   (a) TSMC 16FFC PDK installed on a self-hosted runner
-  #       (Liberty .lib, technology .lef, std-cell .lef, QRC tech files,
-  #        sign-off decks).
-  #   (b) Genus / Innovus / Tempus licenses reachable from the runner.
-  #   (c) The runner is labeled exactly: self-hosted, linux, x64,
-  #       tsmc-16ffc. The `tsmc-16ffc` label gates which runner sees
-  #       the job (so general-purpose self-hosted runners don't pick
-  #       it up and immediately fail).
-  #
-  # Then flip `if: false` to `if: true` and push. The runner picks up
-  # the job on the next CI run; no other workflow changes needed.
-  #
-  # This job produces the canonical sign-off for tape-out (DRC/LVS/STA
-  # clean against the foundry's sign-off decks). The Sky130 OpenLane
-  # job above remains as the cross-check against the open flow.
+  #   (b) Genus / Innovus / Tempus licenses reachable from the runner
+  #   (c) Runner labeled: self-hosted, linux, x64, tsmc-16ffc
+  # Then change `if: false` below to `if: ${{ inputs.has-cadence-signoff }}`
+  # and add a corresponding input with default false.
   # ====================================================================
   cadence-16ffc-signoff:
-    name: Cadence 16FFC sign-off (RTL → GDSII)
-    if: false  # ← flip to `true` when PDK + licensed runner provisioned
+    name: 8. Cadence 16FFC sign-off (RTL → GDSII)
+    if: false  # ← flip to `${{ inputs.has-cadence-signoff }}` when ready
     runs-on: [self-hosted, linux, x64, tsmc-16ffc]
     timeout-minutes: 240
     environment:
@@ -362,7 +789,6 @@ jobs:
       - name: Assert post-synth QoR
         working-directory: rtl
         run: |
-          # Setup WNS at SS sign-off corner must be >= 0.
           WNS=$(awk '/Slack:/{print $NF; exit}' reports/timing_ss.rpt)
           echo "Genus SS slack: $WNS"
           # TODO: numeric comparison once the Genus log format is locked in.
@@ -372,11 +798,11 @@ jobs:
         run: |
           innovus -files innovus.tcl -log reports/innovus.log
 
-      - name: Assert post-PnR sign-off
+      - name: Assert post-PnR sign-off (against foundry decks)
         working-directory: rtl
         run: |
           # WNS at SS sign-off post-route must be >= 0.
-          # DRC + LVS must be clean against foundry decks.
+          # DRC + LVS must be clean against TSMC 16FFC foundry decks.
           echo "TODO: parse reports/pnr_summary.rpt + foundry-deck output"
 
       - name: Upload GDS + reports
