@@ -89,6 +89,15 @@ on:
           up in simulation. Recommended on for every block.
         type: boolean
         default: true
+      extra-rtl-sources:
+        description: |
+          Space-separated list of additional SV files (relative to rtl/)
+          that the top module depends on. E.g., "sram_controller.sv".
+          The shared workflow reads these alongside <block-name>.sv for
+          synthesis, formal equivalence, and coverage. Leave empty for
+          single-file designs.
+        type: string
+        default: ""
       openlane-config-dir:
         description: |
           Path to the LibreLane config dir (relative to repo root).
@@ -243,11 +252,12 @@ jobs:
           TB_FILE=$(ls tb/tb_${{ inputs.block-name }}.sv 2>/dev/null || ls tb/tb_*.sv | head -1)
           DUT_FILE=${{ inputs.block-name }}.sv
 
-          echo "Compiling $DUT_FILE + $TB_FILE for coverage..."
+          EXTRA="${{ inputs.extra-rtl-sources }}"
+          echo "Compiling $DUT_FILE $EXTRA + $TB_FILE for coverage..."
           verilator --binary --coverage-line \
                     --top-module $(basename $TB_FILE .sv) \
                     --timing -Wno-fatal -Wno-WIDTH -Wno-UNUSEDSIGNAL \
-                    $DUT_FILE $TB_FILE \
+                    $DUT_FILE $EXTRA $TB_FILE \
                     --Mdir obj_dir 2>&1 | tail -20
 
           # Verilator's binary lands at obj_dir/V<topname>
@@ -349,7 +359,7 @@ jobs:
       - name: Synthesize ${{ inputs.block-name }}
         working-directory: rtl
         run: |
-          yosys -p "read_verilog -sv ${{ inputs.block-name }}.sv; \
+          yosys -p "read_verilog -sv ${{ inputs.block-name }}.sv ${{ inputs.extra-rtl-sources }}; \
                     synth -flatten -top ${{ inputs.block-name }}" \
                 2>&1 | tee synth.log
 
@@ -446,12 +456,12 @@ jobs:
           #      blocks; raise for deeper pipelines).
           #   5. `equiv_status -assert` exits non-zero if not proven.
           yosys -q -p "
-            read_verilog -sv ${{ inputs.block-name }}.sv
+            read_verilog -sv ${{ inputs.block-name }}.sv ${{ inputs.extra-rtl-sources }}
             hierarchy -top ${{ inputs.block-name }}
             proc; opt; memory; opt
             design -stash gold
 
-            read_verilog -sv ${{ inputs.block-name }}.sv
+            read_verilog -sv ${{ inputs.block-name }}.sv ${{ inputs.extra-rtl-sources }}
             hierarchy -top ${{ inputs.block-name }}
             synth -flatten -top ${{ inputs.block-name }}
             design -stash gate
